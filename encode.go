@@ -44,8 +44,13 @@ Arguments:
           the supported encodings (gob | json | csv) [default: stdin]
 
 Options:
-  --to      Output encoding (gob | json | csv) [default: json]
-  --output  Output file [default: stdout]
+  --to          Output encoding (gob | json | csv) [default: json]
+  --output      Output file [default: stdout]
+  --checkpoint  Wrap the output in the resumable checkpoint stream format,
+                embedding a format version, sequence number ranges and
+                checksum summaries. Truncated files can be decoded up to the
+                last complete record, and out of order or duplicate records
+                are rejected. Inputs in this format are detected automatically.
 
 Examples:
   echo "GET http://:80" | vegeta attack -rate=1/s > results.gob
@@ -57,6 +62,7 @@ func encodeCmd() command {
 	fs := flag.NewFlagSet("vegeta encode", flag.ExitOnError)
 	to := fs.String("to", encodingJSON, "Output encoding "+encs)
 	output := fs.String("output", "stdout", "Output file")
+	checkpoint := fs.Bool("checkpoint", false, "Wrap output in the resumable checkpoint stream format")
 
 	fs.Usage = func() {
 		fmt.Fprintf(os.Stderr, "%s\n", encodeUsage)
@@ -68,11 +74,11 @@ func encodeCmd() command {
 		if len(files) == 0 {
 			files = append(files, "stdin")
 		}
-		return encode(files, *to, *output)
+		return encode(files, *to, *output, *checkpoint)
 	}}
 }
 
-func encode(files []string, to, output string) error {
+func encode(files []string, to, output string, checkpoint bool) error {
 	dec, mc, err := decoder(files)
 	defer mc.Close()
 	if err != nil {
@@ -86,15 +92,36 @@ func encode(files []string, to, output string) error {
 	defer out.Close()
 
 	var enc vegeta.Encoder
-	switch to {
-	case encodingCSV:
-		enc = vegeta.NewCSVEncoder(out)
-	case encodingGob:
-		enc = vegeta.NewEncoder(out)
-	case encodingJSON:
-		enc = vegeta.NewJSONEncoder(out)
-	default:
-		return fmt.Errorf("encode: unknown encoding %q", to)
+	var cp *vegeta.CheckpointEncoder
+	if checkpoint {
+		var cpEnc vegeta.CheckpointEncoding
+		switch to {
+		case encodingCSV:
+			cpEnc = vegeta.CheckpointCSV
+		case encodingGob:
+			cpEnc = vegeta.CheckpointGob
+		case encodingJSON:
+			cpEnc = vegeta.CheckpointJSON
+		default:
+			return fmt.Errorf("encode: unknown encoding %q", to)
+		}
+
+		cp, err = vegeta.NewCheckpointEncoder(out, cpEnc)
+		if err != nil {
+			return err
+		}
+		enc = cp.Encode
+	} else {
+		switch to {
+		case encodingCSV:
+			enc = vegeta.NewCSVEncoder(out)
+		case encodingGob:
+			enc = vegeta.NewEncoder(out)
+		case encodingJSON:
+			enc = vegeta.NewJSONEncoder(out)
+		default:
+			return fmt.Errorf("encode: unknown encoding %q", to)
+		}
 	}
 
 	sigch := make(chan os.Signal, 1)
@@ -103,6 +130,8 @@ func encode(files []string, to, output string) error {
 	for {
 		select {
 		case <-sigch:
+			// Interrupted before the trailer is written: the partial output
+			// stays recoverable up to its last complete checkpoint frame.
 			return nil
 		default:
 		}
@@ -118,5 +147,10 @@ func encode(files []string, to, output string) error {
 		}
 	}
 
+	// The checkpoint encoder doesn't own out, so it only flushes the trailer
+	// carrying the final sequence number range and checksum summary.
+	if cp != nil {
+		return cp.Close()
+	}
 	return nil
 }

@@ -51,6 +51,17 @@ func FuzzJSONDecoder(fuzz []byte) int {
 	return 1
 }
 
+// FuzzCheckpointDecoder tests decoding a checkpoint stream. A malformed
+// stream header is rejected; a stream with a valid header must only ever
+// yield decoded results or io.EOF (including truncated-tail recovery).
+func FuzzCheckpointDecoder(fuzz []byte) int {
+	decoder, err := NewCheckpointDecoder(bytes.NewReader(fuzz))
+	if err != nil {
+		return 0
+	}
+	return readAllResults(decoder.Decode)
+}
+
 func readAllResults(decoder Decoder) (ok bool) {
 	for {
 		result := &Result{}
