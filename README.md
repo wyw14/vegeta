@@ -146,6 +146,8 @@ attack command:
     	Enable TLS session resumption using session tickets
   -targets string
     	Targets file (default "stdin")
+  -targets-ttl value
+    	Cache targets parsed from the -targets file for the given duration and re-read it on expiry, using the previous targets if the re-read fails [-1 = disabled, 0 = forever]. Can't be used with -lazy or stdin. (default -1)
   -timeout duration
     	Requests timeout (default 30s)
   -unix-socket string
@@ -408,6 +410,22 @@ Specifies whether to support TLS session resumption using session tickets.
 
 Specifies the file from which to read targets, defaulting to stdin.
 See the [`-format`](#-format) section to learn about the different target formats.
+
+#### `-targets-ttl`
+
+Specifies how long the targets parsed from the [`-targets`](#-targets) file are
+cached. Targets are read eagerly when the attack starts and re-read from the
+file when the TTL elapses, so the file path (not stdin) must be given and
+[`-lazy`](#-lazy) can't be used. A value of `0` caches the targets for the
+whole attack and never re-reads the file; `-1` (the default) disables caching
+and preserves the traditional one-shot read.
+
+When the TTL elapses, concurrent workers coalesce into a single re-read
+(single flight). If the re-read fails, the attack keeps issuing the previous
+targets and the failure is logged to stderr instead of aborting the attack.
+Each attack gets its own cache scoped to its credentials, so private
+authentication material (such as `Authorization` headers) is never reused
+across attacks.
 
 #### `-timeout`
 

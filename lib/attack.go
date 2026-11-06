@@ -14,24 +14,26 @@ import (
 	"sync"
 	"time"
 
-	"github.com/rs/dnscache"
 	"golang.org/x/net/http2"
 )
 
 // Attacker is an attack executor which wraps an http.Client
 type Attacker struct {
-	dialer     *net.Dialer
-	client     http.Client
-	stopch     chan struct{}
-	stopOnce   sync.Once
-	workers    uint64
-	maxWorkers uint64
-	maxBody    int64
-	redirects  int
-	seqmu      sync.Mutex
-	seq        uint64
-	began      time.Time
-	chunked    bool
+	dialer       *net.Dialer
+	client       http.Client
+	stopch       chan struct{}
+	stopOnce     sync.Once
+	workers      uint64
+	maxWorkers   uint64
+	maxBody      int64
+	redirects    int
+	seqmu        sync.Mutex
+	seq          uint64
+	began        time.Time
+	chunked      bool
+	hostCache    *ResolutionCache[[]string]
+	hostResolver HostResolver
+	onResDiag    func(ResolutionDiag)
 }
 
 const (
@@ -314,12 +316,26 @@ func ConnectTo(addrMap map[string][]string) func(*Attacker) {
 	}
 }
 
-// DNSCaching returns a functional option that enables DNS caching for
-// the given ttl. When ttl is zero cached entries will never expire.
-// When ttl is non-zero, this will start a refresh go-routine that updates
-// the cache every ttl interval. This go-routine will be stopped when the
-// attack is stopped.
-// When the ttl is negative, no caching will be performed.
+// ResolutionDiagnostics returns a functional option that installs a sink
+// for target resolution diagnostics, such as a failed cache refresh after
+// which a stale value was kept serving. The sink must be safe for concurrent
+// use.
+func ResolutionDiagnostics(fn func(ResolutionDiag)) func(*Attacker) {
+	return func(a *Attacker) { a.onResDiag = fn }
+}
+
+// DNSCaching returns a functional option that caches dynamic resolver (DNS)
+// results for the given ttl.
+//
+// When ttl is zero cached entries never expire. When ttl is non-zero, an
+// expired entry is refreshed on demand; concurrent dials that miss the
+// cache are coalesced into a single lookup (single flight). If a refresh
+// fails, the previously resolved addresses keep being served and the
+// failure is reported through the ResolutionDiagnostics sink.
+// When the ttl is negative, no caching is performed.
+//
+// The cache is owned by the Attacker and therefore scoped to a single
+// attack: resolver results are never shared in package global state.
 func DNSCaching(ttl time.Duration) func(*Attacker) {
 	return func(a *Attacker) {
 		if ttl < 0 {
@@ -332,22 +348,13 @@ func DNSCaching(ttl time.Duration) func(*Attacker) {
 				dial = a.dialer.DialContext
 			}
 
-			resolver := &dnscache.Resolver{}
-
-			if ttl != 0 {
-				go func() {
-					refresh := time.NewTicker(ttl)
-					defer refresh.Stop()
-					for {
-						select {
-						case <-refresh.C:
-							resolver.Refresh(true)
-						case <-a.stopch:
-							return
-						}
+			a.hostCache = NewHostResolutionCache(ttl, a.hostResolver,
+				WithDiagnostics(func(diag ResolutionDiag) {
+					if a.onResDiag != nil {
+						a.onResDiag(diag)
 					}
-				}()
-			}
+				}),
+			)
 
 			rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 
@@ -357,7 +364,7 @@ func DNSCaching(ttl time.Duration) func(*Attacker) {
 					return nil, err
 				}
 
-				ips, err := resolver.LookupHost(ctx, host)
+				ips, _, err := ResolveHost(ctx, a.hostCache, host)
 				if err != nil {
 					return nil, err
 				}

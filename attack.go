@@ -1,12 +1,14 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -21,6 +23,11 @@ import (
 	prom "github.com/tsenart/vegeta/v12/lib/prom"
 )
 
+// diagLog receives target resolution diagnostics, such as a refresh
+// failure after which the previous targets or resolver results keep being
+// used.
+var diagLog = log.New(os.Stderr, "vegeta: ", log.LstdFlags)
+
 func attackCmd() command {
 	fs := flag.NewFlagSet("vegeta attack", flag.ExitOnError)
 	opts := &attackOpts{
@@ -30,6 +37,7 @@ func attackCmd() command {
 		rate:         vegeta.Rate{Freq: 50, Per: time.Second},
 		maxBody:      vegeta.DefaultMaxBody,
 		promAddr:     "0.0.0.0:8880",
+		targetsTTL:   -1,
 	}
 	fs.StringVar(&opts.name, "name", "", "Attack name")
 	fs.StringVar(&opts.targetsf, "targets", "stdin", "Targets file")
@@ -45,6 +53,7 @@ func attackCmd() command {
 	fs.BoolVar(&opts.h2c, "h2c", false, "Send HTTP/2 requests without TLS encryption")
 	fs.BoolVar(&opts.insecure, "insecure", false, "Ignore invalid server TLS certificates")
 	fs.BoolVar(&opts.lazy, "lazy", false, "Read targets lazily")
+	fs.Var(&dnsTTLFlag{&opts.targetsTTL}, "targets-ttl", "Cache targets parsed from the -targets file for the given duration and re-read it on expiry, using the previous targets if the re-read fails [-1 = disabled, 0 = forever]. Can't be used with -lazy or stdin.")
 	fs.DurationVar(&opts.duration, "duration", 0, "Duration of the test [0 = forever]")
 	fs.DurationVar(&opts.timeout, "timeout", vegeta.DefaultTimeout, "Requests timeout")
 	fs.Uint64Var(&opts.workers, "workers", vegeta.DefaultWorkers, "Initial number of workers")
@@ -90,6 +99,7 @@ type attackOpts struct {
 	h2c            bool
 	insecure       bool
 	lazy           bool
+	targetsTTL     time.Duration
 	chunked        bool
 	duration       time.Duration
 	timeout        time.Duration
@@ -119,6 +129,15 @@ func attack(opts *attackOpts) (err error) {
 		return fmt.Errorf("-rate=0 requires setting -max-workers")
 	}
 
+	if opts.targetsTTL >= 0 {
+		if opts.lazy {
+			return errors.New("-targets-ttl can't be used with -lazy")
+		}
+		if opts.targetsf == "stdin" {
+			return errors.New("-targets-ttl requires -targets to be a file path: stdin can't be re-read")
+		}
+	}
+
 	if len(opts.resolvers) > 0 {
 		res, err := resolver.NewResolver(opts.resolvers)
 		if err != nil {
@@ -129,8 +148,17 @@ func attack(opts *attackOpts) (err error) {
 
 	net.DefaultResolver.PreferGo = true
 
+	// When target caching is enabled, the targets file is opened and re-opened
+	// by the cache itself on every refresh, so it must not be held open here:
+	// doing so would prevent it from being replaced or deleted (notably on
+	// Windows) while the attack is running.
+	targetsFile := opts.targetsf
+	if opts.targetsTTL >= 0 {
+		targetsFile = ""
+	}
+
 	files := map[string]io.Reader{}
-	for _, filename := range []string{opts.targetsf, opts.bodyf} {
+	for _, filename := range []string{targetsFile, opts.bodyf} {
 		if filename == "" {
 			continue
 		}
@@ -156,22 +184,44 @@ func attack(opts *attackOpts) (err error) {
 		proxyHdr = opts.proxyHeaders.Header
 	)
 
-	switch opts.format {
-	case vegeta.JSONTargetFormat:
-		tr = vegeta.NewJSONTargeter(src, body, hdr)
-	case vegeta.HTTPTargetFormat:
-		tr = vegeta.NewHTTPTargeter(src, body, hdr)
-	default:
-		return fmt.Errorf("format %q isn't one of [%s]",
-			opts.format, strings.Join(vegeta.TargetFormats, ", "))
-	}
-
-	if !opts.lazy {
-		targets, err := vegeta.ReadAllTargets(tr)
+	switch {
+	case opts.targetsTTL >= 0:
+		// Per-attack target resolution cache: the targets file is re-read on
+		// TTL expiry; concurrent workers coalesce refreshes (single flight)
+		// and a failed re-read keeps the attack on the previous target set,
+		// with diagnostics on stderr. The cache owns a fresh authentication
+		// scope and is discarded when this attack ends, so credentials of one
+		// attack can never be served to another.
+		tcache, err := vegeta.NewFileTargetCache(opts.targetsf, opts.format, body, hdr, opts.targetsTTL,
+			vegeta.WithDiagnostics(func(d vegeta.ResolutionDiag) { diagLog.Print(d.String()) }),
+		)
 		if err != nil {
 			return err
 		}
-		tr = vegeta.NewStaticTargeter(targets...)
+		// Fail fast on a missing or malformed targets file, as the eager
+		// non-lazy path does below.
+		if _, _, err = tcache.Resolve(context.Background(), opts.targetsf); err != nil {
+			return err
+		}
+		tr = vegeta.NewCachedTargeter(tcache, opts.targetsf).Targeter()
+	default:
+		switch opts.format {
+		case vegeta.JSONTargetFormat:
+			tr = vegeta.NewJSONTargeter(src, body, hdr)
+		case vegeta.HTTPTargetFormat:
+			tr = vegeta.NewHTTPTargeter(src, body, hdr)
+		default:
+			return fmt.Errorf("format %q isn't one of [%s]",
+				opts.format, strings.Join(vegeta.TargetFormats, ", "))
+		}
+
+		if !opts.lazy {
+			targets, err := vegeta.ReadAllTargets(tr)
+			if err != nil {
+				return err
+			}
+			tr = vegeta.NewStaticTargeter(targets...)
+		}
 	}
 
 	out, err := file(opts.outputf, true)
@@ -222,6 +272,7 @@ func attack(opts *attackOpts) (err error) {
 		vegeta.DNSCaching(opts.dnsTTL),
 		vegeta.ConnectTo(opts.connectTo),
 		vegeta.SessionTickets(opts.sessionTickets),
+		vegeta.ResolutionDiagnostics(func(d vegeta.ResolutionDiag) { diagLog.Print(d.String()) }),
 	)
 
 	res := atk.Attack(tr, opts.rate, opts.duration, opts.name)
