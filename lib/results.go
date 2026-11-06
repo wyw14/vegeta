@@ -107,6 +107,7 @@ type DecoderFactory func(io.Reader) Decoder
 func DecoderFor(r io.Reader) Decoder {
 	var buf bytes.Buffer
 	for _, dec := range []DecoderFactory{
+		NewCheckpointDecoder,
 		NewDecoder,
 		NewJSONDecoder,
 		NewCSVDecoder,
